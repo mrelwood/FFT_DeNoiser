@@ -16,7 +16,9 @@ Notes:
 - The FFT Overlap has a minor effect on the quality of the process, and a higher quality increases CPU usage a bit.
 
 Install instructions:
+- Click on the "mrelwood_DeNoiser.jsfx" in the file list.
+- Click the button "Raw" and save the resulting file on your computer.
 - In REAPER go to Options > Show REAPER resource path...
-- Create a subfolder "mrelwood" in the existing "Effects" folder.
-- Move the "mrelwood_DeNoiser.jsfx" plugin into the "mrelwood" folder you created.
+- Look for the "Effects" folder, open it and and create a subfolder "mrelwood".
+- Move the "mrelwood_DeNoiser.jsfx" plugin into the "mrelwood" folder you just created.
 - Restart REAPER or press F5 in the plugin list for the plugin to show up in REAPER.
