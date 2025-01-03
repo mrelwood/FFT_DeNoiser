@@ -1,0 +1,804 @@
+desc: FFT DeNoiser  [mrelwood]
+
+// DSP engine by "micstepic", source:
+// https://github.com/micsthepick/REAPERDenoiser/blob/main/REAPERDenoiser.jsfx
+
+// GUI by [mrelwood plugins]
+// https://mrelwood5.wixsite.com/plugins
+// 
+
+
+
+
+// Define our user interface.
+// Our FFT size will always be the same, so we only need controls for
+// the noise collection mode and the noise scale (k).
+
+
+///IFTEST* //this section not used by testing code
+// This defines a combo box that allows the user to select "Denoise Input" or
+// "Record Noise Sample". The default value is 0 (Denoise Input). The maximum
+// value is 1 (Record Noise Sample), and it increases in steps of 1.
+slider1:0<0,1,1{Denoise Input, Record Noise Sample}>-Noise Collection Mode
+
+// This defines a slider that can be varied between 0.0 and 10.0 in steps of
+// 0.001, with default value 1.0. (If slider2 is equal to 0.0, this plugin
+// shouldn't really do anything to the input audio.)
+slider2:2.5<0.0,10.0,0.001>-DeNoise Scale
+
+// This defines a combo box for selecting the FFT size used in the STFT process. 
+// The options range from 256 to 32768, allowing the user to choose the resolution 
+// of the Fourier transform. The default value is set to the third option, 1024.
+// This setting affects the granularity and latency of the audio processing, 
+// with larger sizes providing finer frequency resolution but increased processing time.
+slider3:6<0,7,1{128,256,512,1024,2048,4096,8192,16384}>-FFT size
+
+// This defines a combo box for selecting the overlap factor used in the STFT process. 
+// The options are 2, 4, 8, and 16, representing the division of the FFT size 
+// to determine the overlap between successive FFT windows. The default value is 1, 
+// corresponding to an overlap factor of 4. This setting affects the smoothness 
+// and quality of the audio processing, with higher overlaps providing smoother results 
+// at the cost of increased computational load.
+slider4:2<0,3,1{2,4,8,16}>-FFT overlap
+
+slider13:0<0,1,1>-Low Latency Mode
+
+
+
+
+
+
+
+//IFTEST*/ //this section not used by testing code
+
+
+// Here we can label our input and output pins. This also tells REAPER how many
+// channels we can handle. In this case, the plugin is stereo (a monophonic
+// plugin would be simpler, but I almost always use this to denoise stereo
+// audio), so we define two input and output pins.
+in_pin:Noisy Audio 1
+in_pin:Noisy Audio 2
+out_pin:Denoised Audio 1
+out_pin:Denoised Audio 2
+
+
+
+
+///IFTEST*
+@init
+//IFTEST*/
+/*
+slider1=0;
+slider2=0;
+slider3=5;
+slider4=1;
+*/
+
+//IFTEST srate = 24000;
+
+// Memory allocation helper function
+_free_memory = 0; // Global variable to track allocated memory
+function simple_alloc(amount) local(_free_memory_old) global(_free_memory) (
+  _free_memory_old = _free_memory;
+  _free_memory += amount;
+  _free_memory_old; // Return the starting address of the allocated block
+);
+
+function reset_state() (
+	// clear buffer state
+	memset(outputBuffer, 0, MAX_FFT_SIZE*2);
+	memset(inputBuffer, 0, MAX_FFT_SIZE*2);
+	samplesCollected = 0;
+	fftCounter = 0;
+	silence = overlaps;
+);
+
+function window(r) (
+	sin(r*$pi)*sqrt(2);
+);
+
+function gen_window() (
+	i = 0.5;
+	loop(fftSize,
+		windowBuffer[i] = window(i/fftSize);
+		i += 1;
+	);
+);
+
+function upsli() (
+	// A simple function to zero out the noise buffers when switching mode to "Record Noise Sample"
+	// previousMode should default to 0 on first initialization, but setting it to 0 in @init will cause
+	// this code to get run again, and the noise profile lost even when switching to "Denoise Input"
+	slider1 > 0.5 ? (
+		previousMode < 0.5 ? (
+			memset(noiseBuffer, 0, MAX_FFT_SIZE+2);
+			previousMode = 1;
+		)
+	) : previousMode = 0;
+	
+	
+	slider13 == 1 ? slider3 = 0 : slider3 = 7;
+	
+	changed = 0;
+	fftSize = 2^(slider3+7);
+	changed |= fftSize != oldFftSize;
+	oldFftSize = fftSize;
+	changed ? (
+		pls_rec = 1;
+		memset(noiseBuffer, 0, MAX_FFT_SIZE+2);
+	);
+	overlaps = 2^(slider4+1);
+	changed |= overlaps != oldOverlaps;
+	oldOverlaps = overlaps;
+	fftInterval = fftSize/overlaps;
+	fftScalingFactor = 1/overlaps/fftSize;
+	
+	slider13 == 1 ? (
+		kSquared = (slider2/10)^1.7 *20;
+	):(
+		kSquared = sqr( slider2 );
+	);
+	
+	// slider2 is the Noise Scale from above.
+	changed ? (
+		reset_state();
+		gen_window();
+	);
+	pdc_delay = fftSize; 
+	pdc_bot_ch=0;
+	pdc_top_ch=2;
+);
+
+// On initialization, initialize all of our variables.
+MAX_FFT_SIZE = 32768; // Maximum FFT size supported
+
+// Allocate memory for the complex FFT buffer, inputs, outputs, and noise spectrum
+// Note: Each "complex" sample requires two slots: one for the real part and one for the imaginary part
+fftBuffer = simple_alloc(MAX_FFT_SIZE*2); // Complex FFT buffer for processing
+inputBuffer = simple_alloc(MAX_FFT_SIZE*2); // Complex input buffer
+outputBuffer = simple_alloc(MAX_FFT_SIZE*2); // Complex output buffer
+windowBuffer = simple_alloc(MAX_FFT_SIZE);
+noiseBuffer = simple_alloc(MAX_FFT_SIZE+2); // Real buffer for noise spectrum
+
+upsli();
+
+
+freembuf(_free_memory);
+
+@slider
+upsli();
+
+
+
+///IFTEST*
+@sample
+//IFTEST*/
+
+function get_weight(yNorm, nNorm) (
+	yNorm > 0 ? yNorm / (yNorm + kSquared*nNorm) : 0;
+);
+
+function process_stft_segment(fftBuffer, fftSize) (
+	// If slider1 is greater than 0.5 (i.e. the user selected "Record Noise
+	// Sample", we store the FFTs of each of these buffers.
+	slider1 > 0.5? (
+		// for each band, compare the norm of the noise in this frame.
+		// If it is greater than what's already there for this band, then copy
+		// it into the noiseBuffer
+		fft_bin = 0;
+		loop(fftSize/2+1,
+			fft_bin2 = fft_bin ? (fftSize - fft_bin) : 0;
+			left_real = fftBuffer[2*fft_bin] + fftBuffer[2*fft_bin2];
+			left_imag = fftBuffer[2*fft_bin + 1] - fftBuffer[2*fft_bin2 + 1];
+			right_real = fftBuffer[2*fft_bin + 1] + fftBuffer[2*fft_bin2 + 1];
+			right_imag = -fftBuffer[2*fft_bin] + fftBuffer[2*fft_bin2];
+
+			normSquareNew_left = sqr(left_real) + sqr(left_imag);
+			normSquareNew_right = sqr(right_real) + sqr(right_imag);
+
+			normSquareOld_left = noiseBuffer[2*fft_bin];
+			normSquareNew_left >= normSquareOld_left ? (
+				noiseBuffer[2*fft_bin] = normSquareNew_left;
+			);
+
+			normSquareOld_right = noiseBuffer[2*fft_bin+1];
+			normSquareNew_right >= normSquareOld_right ? (
+				noiseBuffer[2*fft_bin+1] = normSquareNew_right;
+			);
+			fft_bin += 1;
+		);
+	);
+
+	// Apply Norbert Weiner's filtering algorithm,
+	//      X(f) = Y(f) * (|Y(f)|^2)/(|Y(f)|^2 + k^2 |N(f)|^2)
+	// sqr() computes the square of a number, and abs() computes the absolute
+	// value of a number. We also include a factor of 1/SIZE, to normalize the
+	// FFT (so that if we don't do any denoising, the input signal is equal to
+	// the output signal).
+
+	// Loop over each band, from bandIndex = 0 to SIZE - 1.
+	fft_bin = 0;
+	loop(fftSize/2+1,
+		fft_bin2 = fft_bin ? (fftSize - fft_bin) : 0;
+		// unfold complex spectra
+		left_real = fftBuffer[2*fft_bin] + fftBuffer[2*fft_bin2];
+		left_imag = fftBuffer[2*fft_bin + 1] - fftBuffer[2*fft_bin2 + 1];
+		right_real = fftBuffer[2*fft_bin + 1] + fftBuffer[2*fft_bin2 + 1];
+		right_imag = -fftBuffer[2*fft_bin] + fftBuffer[2*fft_bin2];
+
+		// apply denoising algorithm to find a multiplier for these spectra.
+		weight_left = get_weight(sqr(left_real) + sqr(left_imag), noiseBuffer[2*fft_bin]);
+		weight_right = get_weight(sqr(right_real) + sqr(right_imag), noiseBuffer[2*fft_bin+1]);
+
+		// multiply spectra
+		left_real *= weight_left;
+		left_imag *= weight_left;
+		right_real *= weight_right;
+		right_imag *= weight_right;
+
+		// re fold complex spectra
+		fftBuffer[2*fft_bin] = (left_real - right_imag)*0.5;
+		fftBuffer[2*fft_bin + 1] = (left_imag + right_real)*0.5;
+		fftBuffer[2*fft_bin2] = (left_real + right_imag)*0.5;
+		fftBuffer[2*fft_bin2 + 1] = (-left_imag + right_real)*0.5;
+		fft_bin += 1;
+	);
+);
+
+//IFTEST function sample_code() (
+
+// input 1 stereo sample
+inputBuffer[samplesCollected*2] = spl0;
+inputBuffer[samplesCollected*2+1] = spl1;
+
+// output 1 stereo sample
+silence > 0 ? (
+	spl0 = spl1 = 0;
+	// silence for fft init
+) : (
+	spl0 = outputBuffer[samplesCollected*2];
+	spl1 = outputBuffer[samplesCollected*2+1];
+);
+
+// clear 1 output buffer sample
+outputBuffer[samplesCollected*2] = outputBuffer[samplesCollected*2+1] = 0;
+
+
+fftCounter += 1;
+
+fftCounter >= fftInterval ? (
+	fftCounter = 0;
+
+	// copy input to fft
+	bufferIndex = samplesCollected + 1;
+	i = 0;
+	loop(fftSize,
+		bufferIndex >= fftSize ? bufferIndex -= fftSize;
+		fftBuffer[i*2] = inputBuffer[bufferIndex*2]*windowBuffer[i];
+		fftBuffer[i*2+1] = inputBuffer[bufferIndex*2+1]*windowBuffer[i];
+		bufferIndex += 1;
+		i += 1;
+	);
+
+	// process
+	fft(fftBuffer, fftSize);
+	fft_permute(fftBuffer, fftSize);
+
+	process_stft_segment(fftBuffer, fftSize);
+
+	fft_ipermute(fftBuffer, fftSize);
+	ifft(fftBuffer, fftSize);
+
+	// copy fft back
+
+	i = 0;
+	bufferIndex = samplesCollected + 1;
+	loop(fftSize,
+		bufferIndex >= fftSize ? bufferIndex -= fftSize;
+		outputBuffer[2*bufferIndex] += fftBuffer[2*i]*fftScalingFactor*windowBuffer[i];
+		outputBuffer[2*bufferIndex+1] += fftBuffer[2*i+1]*fftScalingFactor*windowBuffer[i];
+		bufferIndex += 1;
+		i += 1;
+	);
+	silence > 0 ? silence -= 1;
+);
+
+samplesCollected += 1;
+samplesCollected %= fftSize;
+//IFTEST ); // function sample_code()
+
+
+
+@serialize
+
+//IFTEST function file_var(file, val) (printf("FILE_VAR, FILE: %d, VAL: %g\n", file, val));
+//IFTEST function file_mem(file, val, count) (printf("FILE_MEM, FILE: %d, MEM: %g[0..%d]\n", file, val, count-1));
+///IFEEL*
+// Sliders are serialized automatically, so all we have to serialize is the two
+// noise buffers. JSFX's serialization works in a clever way: when reading the
+// state of the plugin from a serialized version, these functions copy data into
+// noiseBufferL and noiseBufferR. But when writing out the state of the plugin,
+// they work the other way, copying data out of noiseBufferL and noiseBufferR.
+file_mem(0, noiseBuffer, MAX_FFT_SIZE+2);
+//IFEEL*/
+/*IFTEST{ // main test block
+
+// helpers
+function sum_first_pdc_samples(s0val, s1val) (
+	reset_state();
+	spl0sum = 0;
+	spl1sum = 0;
+	loop(pdc_delay,
+		spl0=s0val;
+		spl1=s1val;
+		sample_code();
+		spl0sum += abs(spl0);
+		spl1sum += abs(spl1);
+	);
+	assert_near_equal(0, 0.00000001, spl0sum, "spl0sum for init");
+	assert_near_equal(0, 0.00000001, spl1sum, "spl1sum for init");
+	spl0sum = 0;
+	spl1sum = 0;
+);
+
+printf("SAMPLE_0_0_TEST\n");
+// spl0=0 spl1=0 for 100 output samples
+sum_first_pdc_samples(0, 0);
+loop(100,
+	spl0=0;
+	spl1=0;
+	sample_code();
+	spl0sum += abs(spl0);
+	spl1sum += abs(spl1);
+);
+assert_near_equal(0, 0.001, spl0sum, "SAMPLE_0_0_TEST: spl0sum was not as expected");
+assert_near_equal(0, 0.001, spl1sum, "SAMPLE_0_0_TEST: spl1sum was not as expected");
+printf("spl0sum=%g, spl1sum=%g\n", spl0sum, spl1sum);
+
+printf("SAMPLE_1_0_TEST\n");
+// spl0=1 spl1=0 for for 100 output samples
+sum_first_pdc_samples(1, 0);
+loop(100,
+	spl0=1;
+	spl1=0;
+	sample_code();
+	spl0sum += abs(spl0);
+	spl1sum += abs(spl1);
+);
+assert_near_equal(100, 0.001, spl0sum, "SAMPLE_1_0_TEST: spl0sum was not as expected");
+assert_near_equal(0, 0.001, spl1sum, "SAMPLE_1_0_TEST: spl1sum was not as expected");
+printf("spl0sum=%g, spl1sum=%g\n", spl0sum, spl1sum);
+
+printf("SAMPLE_0_1_TEST\n");
+// spl0=0 spl1=1 for for 100 output samples
+sum_first_pdc_samples(0, 1);
+loop(100,
+	spl0=0;
+	spl1=1;
+	sample_code();
+	spl0sum += abs(spl0);
+	spl1sum += abs(spl1);
+);
+assert_near_equal(0, 0.001, spl0sum, "SAMPLE_0_1_TEST: spl0sum was not as expected");
+assert_near_equal(100, 0.001, spl1sum, "SAMPLE_0_1_TEST: spl1sum was not as expected");
+printf("spl0sum=%g, spl1sum=%g\n", spl0sum, spl1sum);
+
+printf("SAMPLE_1_1_TEST\n");
+// spl0=1 spl1=1 for for 100 output samples
+sum_first_pdc_samples(1, 1);
+loop(100,
+	spl0=1;
+	spl1=1;
+	sample_code();
+	spl0sum += abs(spl0);
+	spl1sum += abs(spl1);
+);
+assert_near_equal(100, 0.001, spl0sum, "SAMPLE_1_1_TEST: spl0sum was not as expected");
+assert_near_equal(100, 0.001, spl1sum, "SAMPLE_1_1_TEST: spl1sum was not as expected");
+printf("spl0sum=%g, spl1sum=%g\n", spl0sum, spl1sum);
+
+test_summary();
+}IFTEST*/ // main test block
+
+
+@gfx 490 280
+
+gfxw = max(350, gfx_w);
+gfxh = max(180, gfx_h);
+
+gfxh = min(gfxh, gfxw*.6);
+gfxw = min(gfxw, gfxh*2.2);
+
+
+scalex = gfxw/350;
+scaley = gfxh/180;
+scale = min(scalex,scaley);
+
+gfx_setfont(3, "Arial", 22*scale, 'bi');
+gfx_setfont(2, "Arial", 12*scale);
+gfx_setfont(1, "Arial", 16*scale);
+
+
+xdim = -.08;
+ydim = -.27;
+gfx_gradrect(0,0,gfxw,gfxh , gr=.35,gr,gr,1 , xdim/gfxw,xdim/gfxw,xdim/gfxw,0 
+, ydim/gfxh,ydim/gfxh,ydim/gfxh,0);
+
+
+
+function xy(x, y)(
+	x != -1 ? gfx_x = x;
+	y != -1 ? gfx_y = y;
+);
+
+
+// Logo
+
+gfx_dest = 4;
+gfx_setimgdim(4,-1,-1);
+gfx_setimgdim(4,150*scale,150*scale);
+gfx_set(gr=.5,gr,gr,.5);
+gfx_circle(75*scale,70*scale ,30*scale ,1);
+
+gfx_setfont(3);
+gfx_set(gr=.5,gr,.2,1);
+xy(75*scale, 75*scale);
+gfx_drawstr("FFT", 265,gfx_x,gfx_y);
+xy(75*scale, 70*scale);
+gfx_drawstr("DeNoiser", 257,gfx_x,gfx_y);
+gfx_dest = -1;
+
+xy(-20, gfxh-115*scale);
+gfx_blit(4,1,-.2);
+
+
+// Author
+
+gfx_set(gr=.65,gr,.3,1);
+gfx_setfont(2);
+xy(gfxw*.97,gfxh*.97 -gfx_texth);
+gfx_drawstr("GUI  by",266,gfx_x,gfx_y);
+xy(gfxw*.98,gfxh*.98);
+gfx_drawstr("mrelwood plugins",266,gfx_x,gfx_y);
+
+
+function gfx_setup2(r, g, b, a)(
+	r2 = r;
+	g2 = g;
+	b2 = b;
+	a2 = a;
+
+	r1 = gfx_r;
+	g1 = gfx_g;
+	b1 = gfx_b;
+	a1 = gfx_a;
+);
+
+function gfx_set2()(
+
+	r1 = gfx_r;
+	g1 = gfx_g;
+	b1 = gfx_b;
+	a1 = gfx_a;
+	
+	gfx_set(r2,g2,b2,a2);
+);
+
+function gfx_set1()(
+
+	r2 = gfx_r;
+	g2 = gfx_g;
+	b2 = gfx_b;
+	a2 = gfx_a;
+	
+	gfx_set(r1,g1,b1,a1);
+);
+
+function mou(id, x, y, w, h)(
+	mouse_cap > 0 && capo == 0 && mouse_x > x && mouse_x < x+w && mouse_y > y && mouse_y < y+h ? (
+		drag = id;
+	);
+);
+
+function rrect(x, y, w, h, r, fill)
+	instance()(
+	
+	x = floor(x);
+	y = floor(y);
+	w = ceil(w);
+	h = ceil(h);
+	
+	r = min(r, min(w*.5, h*.5));
+
+	fill == 0 ? (
+		gfx_arc(x+r, y+r, r, -$pi*.5, 0, 1);
+		gfx_arc(x+w-r, y+r, r, 0, $pi*.5, 1);
+		gfx_arc(x+w-r, y+h-r-1, r, $pi*.5, $pi, 1);
+		gfx_arc(x+r, y+h-r-1, r, $pi, $pi*1.5, 1);
+		
+		gfx_line(x+r, y, x+w-r, y);
+		gfx_line(x+r, y+h, x+w-r, y+h);
+		gfx_line(x, y+r, x, y+h-r);
+		gfx_line(x+w, y+r, x+w, y+h-r);
+	):(
+		gfx_a = 1;
+		gfx_circle(x+r, y+r, r, 1, 1);
+		gfx_circle(x+w-r, y+r, r, 1, 1);
+		gfx_circle(x+w-r, y+h-r, r, 1, 1);
+		gfx_circle(x+r, y+h-r, r, 1, 1);
+		
+		gfx_rect(x+r, y, w-r*2, h+1, 1);
+		gfx_rect(x, y+r, w+1, h-r*2, 1);
+	);
+);
+
+function dot(id, tit1, tit2, x, y)
+	instance(sz)(
+	
+	sz = 10 *scale;
+	
+	gfx_set(gr=.9,gr,gr,1);
+	gfx_circle(x,y,sz,1);
+
+	slider(id) > 0 ? (
+		gfx_set(gr=0,gr,gr,1);
+		gfx_circle(x,y,sz*.6,1);
+		
+		gfx_set(gr=1,gr,gr,1);
+	):(
+		gfx_set(gr=.75,gr,gr,1);
+	);
+
+	
+	xy(x+sz*2.5, y+2);
+	tit2 != 0 ? (
+		gfx_drawstr(tit1,264,gfx_x,gfx_y);
+		xy(x+sz*2.5, y+2);
+		gfx_drawstr(tit2,256,gfx_x,gfx_y);
+	):(
+		gfx_drawstr(tit1,260,gfx_x,gfx_y);
+	);
+	
+	gfx_measurestr(tit1,tit1w,tit1h);
+	
+	this.mou(id, x-sz, y-tit1h , sz*4 +tit1w, tit1h*2);
+);
+
+gfx_setfont(2);
+lowlat.dot(13, "Low Latency &", "Low Quality", gfxw *.2 -40*scale, gfxh*.4 -40*scale);
+
+
+function button(id, tit, x, y, w, h)
+	instance()(
+	
+//     gfx_rect(x-w*.5-3, y-h*.5-3, w+6, h+6, 1);
+	rrect(x-w*.5-4*scale, y-h*.5-3*scale, w+8*scale, h+6*scale, 12*scale, 1);
+	gfx_set2();
+//     gfx_rect(x-w*.5, y-h*.5, w, h, 1);
+	rrect(x-w*.5-scale, y-h*.5, w+scale*2, h, 10*scale, 1);
+	gfx_set1();
+	xy(x+1,y+1);
+	#tit = tit;
+	gfx_drawstr(#tit, 261,gfx_x,gfx_y);
+
+
+
+
+	this.mou(id, x-w*.5-3, y-h*.5-3, w+6, h+6);
+
+
+);
+
+
+pad = gfx_texth * .5;
+gfx_setfont(1);
+
+gfx_measurestr(rec.tit="Record Noise", rec.titw,rec.tith);
+
+
+slider1 == 1 ? (
+	rec.tit = "RECORDING";
+	gfx_set(0,gr=.0,gr,1);
+	gfx_setup2(1,gr=.3,gr,1);
+) :
+pls_rec > 0 ? (
+	(recc += 1) > 15 ? (
+		gfx_set(.6,gr=.0,gr,1);
+		gfx_setup2(gr=.8,gr,gr,1);
+	):(
+		gfx_set(1,gr=.0,gr,1);
+		gfx_setup2(1,gr=.8,gr,1);
+	);
+	recc > 30 ? recc = 0;
+				  
+
+) : (
+
+	gfx_set(.6,gr=.0,gr,1);
+	gfx_setup2(gr=.8,gr,gr,1);
+);
+
+rec.button(1, rec.tit, gfxw*.2, gfxh*.45, rec.titw +pad, rec.tith +pad);
+
+
+
+gfx_dest = 3;
+gfx_setimgdim(3, -1,-1);
+gfx_setimgdim(3, 40,40);
+
+gfx_set(gr=.9,gr,gr,1);
+gfx_rect(18,2,4,8);
+gfx_dest = -1;
+
+
+function knob(id, tit, x, y)
+	instance(sz n v1)(
+
+	sz = 40*scale;
+	
+	// Dial dots
+	
+	gfx_set(gr=.38,gr,gr,1);
+	n = 0;
+	loop(11,
+		xdot = x+ sin( -2.5 + n*.5 ) * sz*1.3;
+		ydot = y- cos( -2.5 + n*.5 ) * sz*1.3;
+		
+		gfx_r += .06 *(n/10);
+		gfx_g -= .04 *(n/10);
+		gfx_b -= .04 *(n/10);
+		
+		gfx_circle(xdot,ydot, sz *.08 ,1);
+		n += 1;
+	);
+	
+	// Dial numbers
+
+	gfx_setfont(2);
+	gfx_set(gr=1,gr,gr,1);
+	n = 0;
+	loop(3,
+		gfx_x = x+ sin( -2.5 + n*.5 ) * sz*1.7;
+		gfx_y = y- cos( -2.5 + n*.5 ) * sz*1.7 +sz*.05;
+		
+		gfx_drawstr( sprintf(#n,"%.f",n) ,261,gfx_x,gfx_y);
+		n += 5;
+	);
+	
+	// Knob
+	
+	gfx_set(gr=.3,.37,gr,1);
+	gfx_circle(x,y,sz, 1);
+	gfx_set(gr=.33,.45,gr,1);
+	gfx_circle(x,y,sz*.9, 1);
+	
+	gfx_set(gr=.35,.57,.42,1);
+	gfx_circle(x,y,sz*.75, 1);
+	gfx_set(gr=.35,.55,.4,1);
+	gfx_circle(x,y,sz*.55, 1);
+
+	xy(x-sz,y-sz);
+	gfx_blit(3,2*scale, -2.5+ 5* slider(id)*.1 );
+	
+	// Value
+	
+	v1 = slider(id)*.1;
+	gfx_setfont(1);
+	gfx_set(gr=1,gr-.4*v1^2,gr-.4*v1^2,1);
+	xy(x,y);
+	gfx_drawstr( sprintf(#val,"%.1f", slider(id)) ,261,gfx_x,gfx_y);
+	
+	// Title
+	
+	xy(x, y+sz *1.7);
+	gfx_drawstr(tit,257,gfx_x,gfx_y);
+	
+	
+	
+	
+	this.mou(id, x-sz,y-sz,sz*2,sz*2);
+	
+);
+
+amt.knob(2, "DeNoise", gfxw *.56, gfxh *.45);
+
+
+
+
+
+function menu(id, tit, lab1, lab2, lab3, offs, x, y)
+	instance(lab1w, lab2w, lab3w, labw, x0, y0, x1, w, h, ytmp)(
+	
+	gfx_measurestr(lab1, lab1w, 0);
+	gfx_measurestr(lab2, lab2w, 0);
+	gfx_measurestr(lab3, lab3w, 0);
+	labw = max( lab1w, max(lab2w, lab3w) );
+
+	gfx_set(gr=.22,gr,gr,1);
+//     gfx_rect(x0=x-labw*.5-pad, y0=y-gfx_texth*1.8, w=labw+pad*2, h=gfx_texth*3.6);
+	rrect(x0=x-labw*.5-pad, y0=y-gfx_texth*1.8, w=labw+pad*2, h=gfx_texth*3.6,
+		5*scale, 1);
+	gfx_set(gr=.4,gr,gr,1);
+//     gfx_rect(x0,y0,w,h, 0);
+	rrect(x0,y0,w,h, 5*scale, 0);
+	gfx_line(x0, ytmp= y-gfx_texth*.6, x0+w, ytmp);
+	gfx_line(x0, ytmp= y+gfx_texth*.6, x0+w, ytmp);
+	
+	x1 = x0 + gfx_texth*.5;
+	xy(x1, y+gfx_texth*1.2 +1);
+	slider(id) + offs == 0 ? gfx_set(gr=.9,gr,gr,1) : gfx_set(gr=.6,gr,gr,1);
+	gfx_drawstr(lab1,260,gfx_x,gfx_y);
+	xy(x1, y +1);
+	slider(id) + offs == 1 ? gfx_set(gr=.9,gr,gr,1) : gfx_set(gr=.6,gr,gr,1);
+	gfx_drawstr(lab2,260,gfx_x,gfx_y);
+	xy(x1, y-gfx_texth*1.2 +1);
+	slider(id) + offs == 2 ? gfx_set(gr=.9,gr,gr,1) : gfx_set(gr=.6,gr,gr,1);
+	gfx_drawstr(lab3,260,gfx_x,gfx_y);
+	
+	gfx_set(gr=.9,gr,gr,1);
+	xy(x,y0-pad);
+	gfx_drawstr(tit,265,gfx_x,gfx_y);
+	
+	
+	this.mou(id, x0, y0, w, h);
+	
+);
+
+gfx_setfont(2);
+quality.menu(4, "FFT Overlap", "4 (Lo Q)" , "8 (Med Q)", "16 (Hi Q)", -1, gfxw*.87,gfxh*.5);
+
+
+
+
+// Doubleclick
+
+drag > 0 && capo == 0 ? (
+	(dbls += 1) > 1 ? dblclk = drag;
+);
+dbls > 0 ? (
+	(dblc += 1) > 15 ? dblc = dbls = 0;
+);
+
+dblclk > 0 ? (
+	dblclk == 2 ? (
+		slider(dblclk) == 2.5 ? slider(dblclk) = 0 : slider(dblclk) = 2.5;
+	);
+	
+	upsli();
+	dblclk = drag = 0;
+);
+
+
+drag > 0 ? (
+
+	(drag == 1 || drag == 13) && capo == 0 ? (
+		(slider(drag) += 1) > 1 ? (
+			slider(drag) = 0;
+			drag == 1 ? pls_rec = 0;
+		);
+	) :
+	
+	drag == 2 ? (
+		slider(drag) += ((mouse_x-mouxo)+(mouyo-mouse_y)) *.08;
+		slider(drag) = max(0, min(10, slider(drag) ));
+	);
+	
+	drag == 4 && capo == 0 ? (
+		slider(drag) = 3- floor((mouse_y-quality.y0) / quality.h *3);
+	);
+	
+	
+	mouse_cap == 0 ? drag = 0;
+	upsli();
+);
+
+
+
+
+
+
+
+
+capo = mouse_cap;
+mouxo = mouse_x;
+mouyo = mouse_y;
