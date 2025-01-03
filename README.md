@@ -1,5 +1,5 @@
-**FFT DeNoiser for REAPER
-**
+FFT DeNoiser for REAPER
+
 A GUI version of micsthepick's fork on the REAPERDenoiser plugin:
 https://github.com/micsthepick/REAPERDenoiser/blob/main/REAPERDenoiser.jsfx
 
